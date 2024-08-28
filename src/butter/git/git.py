@@ -1,3 +1,4 @@
+import pathlib
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable, Iterator
@@ -5,6 +6,8 @@ from typing import Iterable, Iterator
 from git import Repo
 import polars as pl
 from tqdm import tqdm
+
+from butter.git.codeowners import CodeOwnersParser
 
 
 def git_date_to_datetime(value: str) -> datetime:
@@ -64,7 +67,7 @@ def parse_added_date_from_log(
         return git_date_to_datetime(date_committed)
 
 
-def build_file_creation_index(
+def build_file_addition_index(
     repo_path: str, branch: str, show_progress: bool = False
 ) -> pl.DataFrame:
     """
@@ -105,9 +108,30 @@ def build_file_creation_index(
 
     iterator = git_history_iterator(repo, filenames)
     if show_progress:
-        iterator = tqdm(iterator, total=len(filenames))
+        iterator = iter(tqdm(iterator, total=len(filenames)))
 
     return pl.DataFrame(iterator)
+
+
+def find_codeowners(repo: Repo) -> pathlib.Path | None:
+    """
+    Find CODEOWNERS files in the repository.
+
+    Args:
+        repo: The repository object.
+
+    Returns:
+        A list of CODEOWNERS files in the repository.
+    """
+
+    codeowners_files = repo.git.execute(
+        ["git", "ls-files", "--", "CODEOWNERS", "CODEOWNERS.md"]
+    ).splitlines()
+
+    if codeowners_files:
+        return pathlib.Path(repo.working_tree_dir) / codeowners_files[0]
+
+    return codeowners_files
 
 
 def extract_git_commits(
@@ -117,10 +141,10 @@ def extract_git_commits(
     end_date: datetime = None,
     file_creation_index_path: str = None,
     days_ago=30,
-    with_merges: bool = False,
+    with_merge_commits: bool = False,
 ) -> pl.DataFrame:
     """
-    Extract churn data from a Git repository.
+    Extract file-level details from Git commits in a given timespan.
 
     Args:
         repo_path: The path to the repository.
@@ -129,7 +153,7 @@ def extract_git_commits(
         end_date: The end date for the analysis.
         file_creation_index_path: The path to the file creation index.
         days_ago: How many days into the past to include in analysis.
-        with_merges: Whether to include merge commits in the analysis. This is not recommended for churn analysis.
+        with_merge_commits: Whether to include merge commits in the analysis. This is not recommended for churn analysis.
 
     Returns:
         A DataFrame containing the churn data.
@@ -153,29 +177,37 @@ def extract_git_commits(
     if end_date is None:
         end_date = datetime.now()
 
-    churn_data = []
+    # blend in codeowners data
+    if codeowners_file := find_codeowners(repo):
+        codeowners_data = codeowners_file.open("r").read()
+    else:
+        codeowners_data = ""  # hacky, i know
+    codeowners_parser = CodeOwnersParser(codeowners_data)
 
     commits = repo.iter_commits(
         rev=branch,
         since=start_date.isoformat(),
         until=end_date.isoformat(),
-        no_merges=not with_merges,
+        no_merges=not with_merge_commits,
     )
 
+    churn_data = []
+
     for commit in commits:
-        for file, stats in commit.stats.files.items():
-            if file not in file_creation_dates:
+        for filename, stats in commit.stats.files.items():
+            if filename not in file_creation_dates:
                 continue
 
             churn_data.append(
                 {
                     "commit_hash": commit.hexsha,
-                    "file": file,
+                    "filename": filename,
                     "lines_added": stats["insertions"],
                     "lines_deleted": stats["deletions"],
                     "lines_modified": stats["lines"],
                     "commit_date": commit.committed_datetime,
-                    "file_creation_date": file_creation_dates[file],
+                    "file_creation_date": file_creation_dates[filename],
+                    "codeowners": codeowners_parser.get_owners(filename),
                 }
             )
 
